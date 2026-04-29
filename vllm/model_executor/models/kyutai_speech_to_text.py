@@ -196,6 +196,23 @@ class KyutaiSpeechToTextEmbeddings(VocabParallelEmbedding):
 # -----------------------------------------------------------------------------
 
 
+def _bridge_vllm_config(vllm_config: VllmConfig) -> None:
+    """Apply :func:`_bridge_kyutai_config` to ``vllm_config``'s HF config and
+    propagate the widened ``vocab_size`` to the cached ``model_arch_config``.
+
+    The cached ``model_arch_config.vocab_size`` is what
+    :meth:`vllm.config.ModelConfig.get_vocab_size` returns and what the
+    input-id validator checks against; mutating ``hf_config`` alone is
+    not sufficient because the convertor copies the value at
+    ``ModelConfig.__init__`` time.
+    """
+    hf_cfg = vllm_config.model_config.hf_config
+    _bridge_kyutai_config(hf_cfg)
+    arch_cfg = getattr(vllm_config.model_config, "model_arch_config", None)
+    if arch_cfg is not None:
+        arch_cfg.vocab_size = hf_cfg.vocab_size
+
+
 def _bridge_kyutai_config(config) -> None:
     """Plug small naming gaps between the HF Kyutai config and vLLM's
     ``LlamaDecoderLayer`` / ``LlamaAttention`` / runtime expectations.
@@ -265,8 +282,8 @@ class KyutaiSpeechToTextModel(nn.Module):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
+        _bridge_vllm_config(vllm_config)
         config = vllm_config.model_config.hf_config
-        _bridge_kyutai_config(config)
         quant_config = vllm_config.quant_config
 
         self.config = config
