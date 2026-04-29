@@ -200,6 +200,18 @@ def _bridge_kyutai_config(config) -> None:
     ):
         config.layer_types = ["sliding_attention"] * config.num_hidden_layers
 
+    # vLLM's ``get_rope`` reads ``config.rope_parameters`` and falls back
+    # to ``rope_theta=10000`` when missing. The Kyutai HF config exposes
+    # ``rope_theta`` at the top level (100000.0 for the released
+    # checkpoints) but does not pre-bundle ``rope_parameters``.
+    if not getattr(config, "rope_parameters", None):
+        rope_theta = getattr(config, "rope_theta", None)
+        if rope_theta is not None:
+            config.rope_parameters = {
+                "rope_type": "default",
+                "rope_theta": float(rope_theta),
+            }
+
 
 # -----------------------------------------------------------------------------
 # Backbone
