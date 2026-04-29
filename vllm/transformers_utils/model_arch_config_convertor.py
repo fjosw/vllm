@@ -524,9 +524,36 @@ class Gemma4ModelArchConfigConvertor(ModelArchConfigConvertorBase):
         return max(head_dim, global_head_dim) or super().get_head_size()
 
 
+class KyutaiSpeechToTextModelArchConfigConvertor(ModelArchConfigConvertorBase):
+    """Kyutai STT widens the *input* vocab beyond the LM-head vocab so the
+    embedding table can hold both text tokens and per-codebook audio
+    tokens.
+
+    The HF config exposes ``vocab_size`` as the text vocab; the
+    multi-stream embedding has ``vocab_size + num_codebooks *
+    codebook_vocab_size + 1`` rows. vLLM's input-id validator and the
+    model's :class:`vllm.config.ModelConfig.get_vocab_size` need the
+    wider value so that BOS / per-codebook ids / the audio-pad sentinel
+    are all accepted as valid input ids.
+    """
+
+    def get_vocab_size(self) -> int:
+        cfg = self.hf_text_config
+        text_vocab = int(getattr(cfg, "text_vocab_size", cfg.vocab_size))
+        num_codebooks = int(getattr(cfg, "num_codebooks", 0))
+        codebook_vocab = int(getattr(cfg, "codebook_vocab_size", 0))
+        full = text_vocab + num_codebooks * codebook_vocab + 1
+        # Persist the original text vocab on the config; the model uses it
+        # to size the LM head and the logits processor.
+        cfg.text_vocab_size = text_vocab
+        cfg.vocab_size = full
+        return full
+
+
 # hf_config.model_type -> convertor class
 MODEL_ARCH_CONFIG_CONVERTORS = {
     "cohere_asr": CohereAsrModelArchConfigConvertor,
+    "kyutai_speech_to_text": KyutaiSpeechToTextModelArchConfigConvertor,
     "mamba": MambaModelArchConfigConvertor,
     "falcon_mamba": MambaModelArchConfigConvertor,
     "timm_wrapper": TerratorchModelArchConfigConvertor,

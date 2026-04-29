@@ -196,40 +196,6 @@ class KyutaiSpeechToTextEmbeddings(VocabParallelEmbedding):
 # -----------------------------------------------------------------------------
 
 
-# -----------------------------------------------------------------------------
-# Register a config convertor so vLLM uses the *embedding-table* extent as the
-# input vocab size, even though the LM head outputs only the text vocab.
-# -----------------------------------------------------------------------------
-
-
-def _register_kyutai_config_convertor() -> None:
-    from vllm.transformers_utils.model_arch_config_convertor import (
-        MODEL_ARCH_CONFIG_CONVERTORS,
-        ModelArchConfigConvertorBase,
-    )
-
-    if "kyutai_speech_to_text" in MODEL_ARCH_CONFIG_CONVERTORS:
-        return
-
-    class _Convertor(ModelArchConfigConvertorBase):
-        def get_vocab_size(self) -> int:
-            cfg = self.hf_text_config
-            text_vocab = int(getattr(cfg, "text_vocab_size", cfg.vocab_size))
-            num_codebooks = int(getattr(cfg, "num_codebooks", 0))
-            codebook_vocab = int(getattr(cfg, "codebook_vocab_size", 0))
-            full = text_vocab + num_codebooks * codebook_vocab + 1
-            # Side-effect: cache the original text vocab on the config for
-            # everywhere else that needs it (LM head, embedding init).
-            cfg.text_vocab_size = text_vocab
-            cfg.vocab_size = full
-            return full
-
-    MODEL_ARCH_CONFIG_CONVERTORS["kyutai_speech_to_text"] = _Convertor
-
-
-_register_kyutai_config_convertor()
-
-
 def _bridge_vllm_config(vllm_config: VllmConfig) -> None:
     """Apply :func:`_bridge_kyutai_config` to ``vllm_config``'s HF config and
     propagate the widened ``vocab_size`` to the cached ``model_arch_config``.
@@ -269,16 +235,13 @@ def _bridge_kyutai_config(config) -> None:
 
     All fixes are idempotent.
     """
-    # Widen vocab_size to the full embedding-table extent for input
-    # validation; preserve the original text vocab size for the LM head.
+    # ``text_vocab_size`` and the widened ``vocab_size`` are populated by
+    # ``KyutaiSpeechToTextModelArchConfigConvertor`` at ``ModelConfig``
+    # construction time (so the input-id validator sees the wider vocab).
+    # Don't redo it here — but make sure the attribute exists in the
+    # one-off case where the convertor wasn't reached.
     if not hasattr(config, "text_vocab_size") or config.text_vocab_size is None:
         config.text_vocab_size = int(config.vocab_size)
-        full_size = (
-            config.text_vocab_size
-            + int(config.num_codebooks) * int(config.codebook_vocab_size)
-            + 1
-        )
-        config.vocab_size = full_size
 
     if not hasattr(config, "intermediate_size") or config.intermediate_size is None:
         ffn_dim = getattr(config, "ffn_dim", None)
