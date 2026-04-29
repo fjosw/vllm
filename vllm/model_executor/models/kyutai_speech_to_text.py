@@ -539,6 +539,18 @@ class KyutaiSttMultiModalProcessor(BaseMultiModalProcessor[KyutaiSttProcessingIn
         if not audios:
             return BatchFeature({"input_ids": [prompt_ids]}, tensor_type="pt")
 
+        # When audio is present, prepend the text-stream BOS to the prompt
+        # ids. The :class:`PromptInsertion` below appends N audio-pad
+        # placeholders *after* the prompt, giving the runtime sequence
+        # ``[BOS, audio_pad * N]``. Keeping BOS *outside* the insertion is
+        # important because vLLM marks the entire inserted span as a
+        # multimodal placeholder; if BOS were inside, vLLM would count
+        # it as one extra placeholder and the
+        # :func:`_merge_multimodal_embeddings` scatter would mismatch.
+        cfg = self.info.ctx.model_config.hf_config
+        bos = int(cfg.bos_token_id)
+        prompt_ids = [bos] + list(prompt_ids)
+
         fe = self.info.get_feature_extractor()
         out = fe(
             list(audios),
@@ -575,7 +587,6 @@ class KyutaiSttMultiModalProcessor(BaseMultiModalProcessor[KyutaiSttProcessingIn
         cfg = self.info.ctx.model_config.hf_config
         frame_size = _resolve_frame_size(cfg.codec_config)
         audio_pad = int(cfg.audio_pad_token_id)
-        bos = int(cfg.bos_token_id)
         out_audio = out_mm_kwargs.require_data().get("audio", [])
 
         def get_insertion(item_idx: int):
@@ -590,13 +601,15 @@ class KyutaiSttMultiModalProcessor(BaseMultiModalProcessor[KyutaiSttProcessingIn
             # placeholder count vs. the codec's output length triggers a
             # scatter-out-of-bounds in ``_merge_multimodal_embeddings``.
             n_frames = max(1, -(-int(n_samples) // frame_size))
-            # BOS token at position 0, then N audio-frame placeholders.
-            return [bos] + [audio_pad] * n_frames
+            return [audio_pad] * n_frames
 
+        # Insert at the *end* of the prompt — :meth:`_call_hf_processor`
+        # has already prepended the BOS text token so the sequence ends
+        # up as ``[BOS, audio_pad * N]``.
         return [
             PromptInsertion(
                 modality="audio",
-                target=PromptIndexTargets.start(),
+                target=PromptIndexTargets.end(),
                 insertion=get_insertion,
             )
         ]
