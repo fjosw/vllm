@@ -644,6 +644,16 @@ class KyutaiSpeechToTextForConditionalGeneration(
         # ``embed_multimodal``).
         self.codec_model = MimiModel(config.codec_config)
 
+        # ``audio_pad_token_id`` is the multimodal placeholder we insert at
+        # every audio-frame position; it lives in the *combined* embedding
+        # table (vocab + per-codebook ranges + 1 pad row) which is wider
+        # than ``config.vocab_size`` (the text vocab). Inform vLLM so it
+        # masks these OOV ids before the text embedding lookup.
+        self.configure_mm_token_handling(
+            vocab_size=config.vocab_size,
+            mm_token_ids=[int(config.audio_pad_token_id)],
+        )
+
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
