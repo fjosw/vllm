@@ -50,12 +50,14 @@ question; we are deliberately punting on it until step 2 lands and we can
 profile the actual decode path.
 """
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from itertools import islice
 from typing import TYPE_CHECKING, ClassVar
 
+import numpy as np
 import torch
 from torch import nn
+from transformers import BatchFeature, MimiModel
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
@@ -70,13 +72,32 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.llama import LlamaDecoderLayer
+from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.inputs import (
+    MultiModalFieldConfig,
+    MultiModalKwargsItems,
+)
+from vllm.multimodal.parse import MultiModalDataItems, MultiModalDataParser
+from vllm.multimodal.processing import (
+    BaseDummyInputsBuilder,
+    BaseMultiModalProcessor,
+    BaseProcessingInfo,
+    PromptReplacement,
+    PromptUpdate,
+)
 from vllm.sequence import IntermediateTensors
 
-from .interfaces import SupportsPP, SupportsTranscription
+from .interfaces import (
+    MultiModalEmbeddings,
+    SupportsMultiModal,
+    SupportsPP,
+    SupportsTranscription,
+)
 from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
     WeightsMapper,
+    _merge_multimodal_embeddings,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -84,8 +105,9 @@ from .utils import (
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, SpeechToTextConfig
+    from vllm.config.multimodal import BaseDummyOptions
     from vllm.config.speech_to_text import SpeechToTextParams
-    from vllm.inputs import PromptType
+    from vllm.inputs import MultiModalDataDict, PromptType
 
 
 # -----------------------------------------------------------------------------
@@ -388,30 +410,189 @@ def _resolve_codec_rates(
     return int(sample_rate), float(frame_rate)
 
 
+def _resolve_frame_size(config) -> int:
+    """Number of audio samples per Mimi frame (1920 for 24 kHz / 12.5 Hz)."""
+    frame_size = getattr(config, "frame_size", None)
+    if frame_size:
+        return int(frame_size)
+    sample_rate, frame_rate = _resolve_codec_rates(config)
+    return int(round(sample_rate / frame_rate))
+
+
+# -----------------------------------------------------------------------------
+# Multimodal processor (Mimi-codec-backed)
+# -----------------------------------------------------------------------------
+
+
+_AUDIO_PLACEHOLDER = "<|kyutai_audio|>"
+"""Sentinel substring inserted by :class:`KyutaiSttDummyInputsBuilder` and
+:meth:`KyutaiSpeechToTextForConditionalGeneration.get_placeholder_str`.
+The :class:`KyutaiSttMultiModalProcessor` rewrites it into the right
+number of ``audio_pad_token_id`` placeholder ids based on the audio
+length."""
+
+
+class KyutaiSttProcessingInfo(BaseProcessingInfo):
+    def get_hf_processor(self, **kwargs: object):
+        # The HF processor wraps tokenizer + KyutaiSpeechToTextFeatureExtractor.
+        return self.ctx.get_hf_processor(**kwargs)
+
+    def get_feature_extractor(self, **kwargs: object):
+        return self.get_hf_processor(**kwargs).feature_extractor
+
+    def get_data_parser(self) -> MultiModalDataParser:
+        fe = self.get_feature_extractor()
+        return MultiModalDataParser(target_sr=fe.sampling_rate, target_channels=1)
+
+    def get_supported_mm_limits(self) -> Mapping[str, int | None]:
+        # One audio per request is the practical case for STT.
+        return {"audio": 1}
+
+    def get_mm_max_tokens_per_item(
+        self,
+        seq_len: int,
+        mm_counts: Mapping[str, int] | None = None,
+    ) -> Mapping[str, int]:
+        if not mm_counts or mm_counts.get("audio", 0) <= 0:
+            return {}
+        # Worst-case audio length is bounded by ``max_position_embeddings``
+        # (375 frames for the 1B/2.6B checkpoints) minus the BOS token.
+        cfg = self.ctx.model_config.hf_config
+        max_frames = max(1, int(cfg.max_position_embeddings) - 1)
+        return {"audio": max_frames}
+
+
+class KyutaiSttDummyInputsBuilder(BaseDummyInputsBuilder[KyutaiSttProcessingInfo]):
+    def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
+        return _AUDIO_PLACEHOLDER * mm_counts.get("audio", 0)
+
+    def get_dummy_mm_data(
+        self,
+        seq_len: int,
+        mm_counts: Mapping[str, int],
+        mm_options: Mapping[str, "BaseDummyOptions"],
+    ) -> "MultiModalDataDict":
+        num_audios = mm_counts.get("audio", 0)
+        if num_audios <= 0:
+            return {}
+        fe = self.info.get_feature_extractor()
+        # 30 seconds of silence is comfortably within the model's window
+        # without saturating it.
+        n_samples = 30 * fe.sampling_rate
+        return {
+            "audio": self._get_dummy_audios(
+                length=n_samples,
+                num_audios=num_audios,
+                overrides=mm_options.get("audio"),
+            )
+        }
+
+
+class KyutaiSttMultiModalProcessor(BaseMultiModalProcessor[KyutaiSttProcessingInfo]):
+    """Build the prompt + run the Kyutai feature extractor.
+
+    The Mimi codec itself does *not* run here — the encoded ``audio_codes``
+    are produced inside the model on GPU as part of ``embed_multimodal``.
+    This keeps the heavy codec on the same device as the LM and avoids
+    moving raw waveforms through the request pipeline.
+    """
+
+    def _call_hf_processor(
+        self,
+        prompt: str,
+        mm_data: Mapping[str, object],
+        mm_kwargs: Mapping[str, object],
+        tok_kwargs: Mapping[str, object],
+    ) -> BatchFeature:
+        audios = mm_data.get("audios") or mm_data.get("audio") or []
+        tok = self.info.get_tokenizer()
+        text_no_placeholders = prompt.replace(_AUDIO_PLACEHOLDER, "")
+        prompt_ids = tok.encode(text_no_placeholders) if text_no_placeholders else []
+
+        if not audios:
+            # Text-only is not the intended usage but keep the path open.
+            return BatchFeature({"input_ids": [prompt_ids]}, tensor_type="pt")
+
+        fe = self.info.get_feature_extractor()
+        # ``audios`` is a list[np.ndarray]; the FE returns ``input_values``
+        # padded with the configured silence prefix + audio delay.
+        out = fe(
+            list(audios),
+            sampling_rate=fe.sampling_rate,
+            return_tensors="pt",
+            padding=True,
+        )
+        input_values = out["input_values"]  # (n_audios, 1, n_samples)
+        return BatchFeature(
+            {"input_values": input_values, "input_ids": [prompt_ids]},
+            tensor_type="pt",
+        )
+
+    def _get_mm_fields_config(
+        self,
+        hf_inputs: BatchFeature,
+        hf_processor_mm_kwargs: Mapping[str, object],
+    ) -> Mapping[str, MultiModalFieldConfig]:
+        return {
+            "input_values": MultiModalFieldConfig.batched("audio"),
+        }
+
+    def _get_prompt_updates(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        out_mm_kwargs: MultiModalKwargsItems,
+    ) -> Sequence[PromptUpdate]:
+        cfg = self.info.ctx.model_config.hf_config
+        frame_size = _resolve_frame_size(cfg.codec_config)
+        audio_pad = int(cfg.audio_pad_token_id)
+        out_audio = out_mm_kwargs.require_data().get("audio", [])
+
+        def get_replacement(item_idx: int):
+            input_values = out_audio[item_idx].get_data()["input_values"]
+            n_samples = (
+                input_values.shape[-1]
+                if isinstance(input_values, torch.Tensor)
+                else int(np.asarray(input_values).shape[-1])
+            )
+            n_frames = max(1, int(n_samples) // frame_size)
+            return [audio_pad] * n_frames
+
+        return [
+            PromptReplacement(
+                modality="audio",
+                target=_AUDIO_PLACEHOLDER,
+                replacement=get_replacement,
+            )
+        ]
+
+
+@MULTIMODAL_REGISTRY.register_processor(
+    KyutaiSttMultiModalProcessor,
+    info=KyutaiSttProcessingInfo,
+    dummy_inputs=KyutaiSttDummyInputsBuilder,
+)
 class KyutaiSpeechToTextForConditionalGeneration(
-    nn.Module, SupportsPP, SupportsTranscription
+    nn.Module, SupportsMultiModal, SupportsPP, SupportsTranscription
 ):
     """Top-level Kyutai STT model.
 
-    Wires the LM backbone, the tied LM head, and the transcription glue.
+    Wires the LM backbone, the tied LM head, the Mimi codec sub-module,
+    and the multimodal / transcription glue.
 
-    Multimodal handling is intentionally split into two stages:
+    The Mimi codec runs on GPU in :meth:`embed_multimodal`, turning
+    feature-extracted ``input_values`` (raw waveform with the
+    silence-prefix and audio-delay padding the HF feature extractor
+    applies) into per-frame codebook ids; those are then summed against
+    the embedding table in :meth:`embed_input_ids` to produce the
+    additive audio bias that overlays the text token embedding at the
+    audio-frame placeholder positions.
 
-    1. **Now**: callers run the Mimi codec themselves, build the per-frame
-       additive bias via :meth:`KyutaiSpeechToTextEmbeddings.embed_audio_only`,
-       sum it into the text embedding, and feed the result to vLLM via
-       ``EmbedsPrompt(prompt_embeds=...)``. This is the path used by the
-       parity tests.
-    2. **Next**: a Mimi-codec-backed
-       :class:`~vllm.multimodal.processing.BaseMultiModalProcessor` will be
-       registered so the model can be called via ``/v1/audio/transcriptions``
-       directly. At that point ``SupportsMultiModal`` will be re-declared
-       and :meth:`embed_multimodal` / :meth:`embed_input_ids` will be
-       wired through ``MULTIMODAL_REGISTRY.register_processor``.
-
-    Splitting the work this way lets us land + verify the LM-backbone
-    parity (this commit) without depending on the Mimi-codec preprocessor,
-    which is its own self-contained chunk of work.
+    Note: this implements the *prefill* path of the multimodal pipeline.
+    Kyutai's full inference loop also requires the audio bias at every
+    decode step (since both streams advance in lockstep); that wiring is
+    deferred to a follow-up since vLLM's standard merge runs only at
+    placeholder positions in the prompt.
     """
 
     packed_modules_mapping: ClassVar[Mapping[str, list[str]]] = {
@@ -454,11 +635,18 @@ class KyutaiSpeechToTextForConditionalGeneration(
         sample_rate, frame_rate = _resolve_codec_rates(config)
         self._sample_rate = sample_rate
         self._frame_rate = frame_rate
+        self._frame_size = _resolve_frame_size(config.codec_config)
 
         self.model = KyutaiSpeechToTextModel(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "model"),
         )
+
+        # Mimi codec is a sub-module so its weights are loaded from the same
+        # checkpoint and live on the same device as the LM. It is *not*
+        # part of the vLLM compile graph (its forward only runs inside
+        # ``embed_multimodal``).
+        self.codec_model = MimiModel(config.codec_config)
 
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
@@ -477,14 +665,78 @@ class KyutaiSpeechToTextForConditionalGeneration(
             self.model.make_empty_intermediate_tensors
         )
 
-    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Pure text-stream embedding lookup.
+    # -------------------------------------------------------------------
+    # SupportsMultiModal
+    # -------------------------------------------------------------------
 
-        Audio bias is supplied by the caller (currently via precomputed
-        ``inputs_embeds``); the future multimodal-processor path will add
-        it through the ``SupportsMultiModal`` machinery.
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+        if modality.startswith("audio"):
+            return _AUDIO_PLACEHOLDER
+        return None
+
+    def get_language_model(self) -> nn.Module:
+        return self.model
+
+    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
+        """Mimi-encode the per-audio waveforms and return the additive bias.
+
+        Expected kwarg: ``input_values`` shape ``(num_audios, 1, n_samples)``
+        (channels-first, single-channel) — the output of the HF
+        ``KyutaiSpeechToTextFeatureExtractor`` with the configured
+        silence-prefix and audio-delay padding applied.
         """
-        return self.model.embed_input_ids(input_ids)
+        input_values = kwargs.pop("input_values", None)
+        if input_values is None:
+            return []
+        if isinstance(input_values, list):
+            iv = torch.stack([torch.as_tensor(x) for x in input_values], dim=0)
+        else:
+            iv = torch.as_tensor(input_values)
+        # Move to the codec's device + dtype.
+        iv = iv.to(device=self.codec_model.device, dtype=self.codec_model.dtype)
+        with torch.no_grad():
+            codec_out = self.codec_model.encode(iv, return_dict=True)
+            # ``audio_codes`` shape: (B, num_codebooks, n_frames)
+            codes = codec_out.audio_codes
+        # Re-orient to (B, n_frames, num_codebooks) and embed.
+        codes = codes.transpose(1, 2).contiguous()
+        embed = self.model.embed_tokens
+        per_audio: list[torch.Tensor] = []
+        for b in range(codes.shape[0]):
+            per_audio.append(embed.embed_audio_only(codes[b]))
+        return per_audio
+
+    def embed_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings: MultiModalEmbeddings | None = None,
+        *,
+        is_multimodal: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Compose the input embedding from text + audio bias.
+
+        At positions flagged by ``is_multimodal`` (the audio-frame
+        placeholders the multimodal processor inserts), we add the
+        per-frame audio bias supplied by :meth:`embed_multimodal` to the
+        text embedding. Because the placeholder text token id is
+        ``audio_pad_token_id`` (whose row in the embedding table is zero
+        by HF convention), the additive merge is numerically equivalent
+        to the standard "replace at placeholder" merge in this prefill
+        regime.
+        """
+        text_embeds = self.model.embed_input_ids(input_ids)
+        if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
+            return text_embeds
+        if is_multimodal is None:
+            return text_embeds
+        return _merge_multimodal_embeddings(
+            inputs_embeds=text_embeds,
+            multimodal_embeddings=multimodal_embeddings,
+            is_multimodal=is_multimodal.to(
+                device=text_embeds.device, non_blocking=True
+            ),
+        )
 
     # -------------------------------------------------------------------
     # Forward / logits / weights
@@ -506,29 +758,47 @@ class KyutaiSpeechToTextForConditionalGeneration(
         return self.logits_processor(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load HF (transformers-format) weights, with the qkv split and
-        the gate/up chunk-split handled by ``AutoWeightsLoader`` via the
-        merged-projection convention.
+        """Load HF (transformers-format) weights for both the LM backbone
+        and the Mimi codec sub-module.
 
-        ``mlp.fc1.weight`` is the merged gate+up tensor in the HF impl;
-        the ``WeightsMapper`` rewrites the name to ``mlp.gate_up_proj``,
-        and the standard ``MergedColumnParallelLinear.weight_loader``
-        consumes the unsharded tensor directly.
+        The qkv stack and gate/up chunk-split for the LM backbone are
+        handled inside :meth:`KyutaiSpeechToTextModel.load_weights`, which
+        ``AutoWeightsLoader`` dispatches to when it descends into the
+        ``model.`` prefix. The Mimi codec is loaded through its own
+        ``HF`` ``state_dict`` machinery via the standard plain-name path.
         """
+        # The Mimi codec's weight names (``codec_model.*``) match HF's
+        # MimiModel state dict directly, so route them through a
+        # PyTorch-native load. We separate them from the LM weights to
+        # avoid AutoWeightsLoader trying to walk ``codec_model``'s
+        # internals (it has its own conventions and we don't need its
+        # extras).
+        codec_weights: dict[str, torch.Tensor] = {}
+        backbone_weights: list[tuple[str, torch.Tensor]] = []
+        for name, w in weights:
+            if name.startswith("codec_model."):
+                codec_weights[name[len("codec_model.") :]] = w
+            else:
+                backbone_weights.append((name, w))
+
         loader = AutoWeightsLoader(
             self,
             skip_prefixes=(
-                # Tied LM head is filled from the embedding; ignore any
-                # explicit ``lm_head.weight`` key in the checkpoint.
                 ["lm_head."]
                 if getattr(self.config, "tie_word_embeddings", False)
                 else None
             ),
-            # The codec model lives in the multimodal preprocessor, not
-            # in this module. Skip it whenever it appears.
             ignore_unexpected_prefixes=["codec_model."],
         )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded = loader.load_weights(backbone_weights, mapper=self.hf_to_vllm_mapper)
+
+        if codec_weights:
+            missing, unexpected = self.codec_model.load_state_dict(
+                codec_weights, strict=False
+            )
+            for n in self.codec_model.state_dict().keys() - set(missing):
+                loaded.add(f"codec_model.{n}")
+        return loaded
 
     # -------------------------------------------------------------------
     # SupportsTranscription
