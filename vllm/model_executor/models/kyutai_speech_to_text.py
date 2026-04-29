@@ -24,26 +24,30 @@ This module reuses ``LlamaDecoderLayer`` for the backbone and provides:
 * ``KyutaiSpeechToTextModel``: the LLaMA-shaped backbone using the custom
   embedding and decoder layer.
 * ``KyutaiSpeechToTextForConditionalGeneration``: the top-level
-  CausalLM wrapper. Implements ``SupportsMultiModal`` and
-  ``SupportsTranscription``. ``embed_multimodal`` consumes the per-frame
-  ``audio_codes`` produced by the (yet-to-be-registered) multimodal
-  preprocessor and returns the additive bias as ``MultiModalEmbeddings``.
+  CausalLM wrapper. Implements ``SupportsTranscription``.
 
-**Known limitation — autoregressive decode**
+**Multimodal handling — current state**
 
-The Kyutai architecture adds the audio bias at *every* position, including
-positions sampled during decode. vLLM's standard multimodal path provides
-``MultiModalEmbeddings`` only at placeholder positions declared in the
-prompt; once the model autoregresses past the prompt, the audio bias is no
-longer plumbed in. Closing that gap requires either (a) a vLLM runner
-extension that can supply per-step multimodal embeddings indexed by
-absolute position, or (b) declaring the full generation horizon as a
-multimodal-placeholder span at prompt time. Both are follow-up work and
-are *not* solved by this module on its own. The ``embed_input_ids``
-override below is correct for the prefill / placeholder path; it
-gracefully no-ops when no multimodal embedding is supplied (decode), which
-matches the architecture only when the audio bias is known to be zero at
-that position.
+This commit provides the LM backbone only. Audio handling is split into
+two stages:
+
+1. **Now**: callers run the Mimi codec themselves, build the per-frame
+   additive bias via :meth:`KyutaiSpeechToTextEmbeddings.embed_audio_only`,
+   sum it into the text embedding, and feed the result to vLLM via
+   ``EmbedsPrompt(prompt_embeds=...)``. End-to-end forward parity with
+   the transformers reference is locked down via the test scripts in this
+   repo.
+2. **Next**: a Mimi-codec-backed
+   :class:`~vllm.multimodal.processing.BaseMultiModalProcessor` will be
+   registered so the model can be called via ``/v1/audio/transcriptions``
+   directly. At that point ``SupportsMultiModal`` will be added and
+   ``embed_multimodal`` / ``embed_input_ids`` will go through the
+   ``MULTIMODAL_REGISTRY.register_processor`` machinery.
+
+The autoregressive-decode pattern (audio bias added at *every* sampled
+position, not just at prompt placeholders) is the deeper integration
+question; we are deliberately punting on it until step 2 lands and we can
+profile the actual decode path.
 """
 
 from collections.abc import Iterable, Mapping
@@ -68,12 +72,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.llama import LlamaDecoderLayer
 from vllm.sequence import IntermediateTensors
 
-from .interfaces import (
-    MultiModalEmbeddings,
-    SupportsMultiModal,
-    SupportsPP,
-    SupportsTranscription,
-)
+from .interfaces import SupportsPP, SupportsTranscription
 from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
@@ -390,15 +389,29 @@ def _resolve_codec_rates(
 
 
 class KyutaiSpeechToTextForConditionalGeneration(
-    nn.Module, SupportsMultiModal, SupportsPP, SupportsTranscription
+    nn.Module, SupportsPP, SupportsTranscription
 ):
     """Top-level Kyutai STT model.
 
-    Wires the LM backbone, the tied LM head, and the multimodal /
-    transcription glue. The Mimi codec itself is *not* a sub-module of
-    this class — it lives in the multimodal preprocessor (out of band of
-    the vLLM compile graph) and feeds per-frame ``audio_codes`` into
-    :meth:`embed_multimodal`.
+    Wires the LM backbone, the tied LM head, and the transcription glue.
+
+    Multimodal handling is intentionally split into two stages:
+
+    1. **Now**: callers run the Mimi codec themselves, build the per-frame
+       additive bias via :meth:`KyutaiSpeechToTextEmbeddings.embed_audio_only`,
+       sum it into the text embedding, and feed the result to vLLM via
+       ``EmbedsPrompt(prompt_embeds=...)``. This is the path used by the
+       parity tests.
+    2. **Next**: a Mimi-codec-backed
+       :class:`~vllm.multimodal.processing.BaseMultiModalProcessor` will be
+       registered so the model can be called via ``/v1/audio/transcriptions``
+       directly. At that point ``SupportsMultiModal`` will be re-declared
+       and :meth:`embed_multimodal` / :meth:`embed_input_ids` will be
+       wired through ``MULTIMODAL_REGISTRY.register_processor``.
+
+    Splitting the work this way lets us land + verify the LM-backbone
+    parity (this commit) without depending on the Mimi-codec preprocessor,
+    which is its own self-contained chunk of work.
     """
 
     packed_modules_mapping: ClassVar[Mapping[str, list[str]]] = {
@@ -464,90 +477,14 @@ class KyutaiSpeechToTextForConditionalGeneration(
             self.model.make_empty_intermediate_tensors
         )
 
-    # -------------------------------------------------------------------
-    # SupportsMultiModal
-    # -------------------------------------------------------------------
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Pure text-stream embedding lookup.
 
-    @classmethod
-    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
-        if modality.startswith("audio"):
-            # Concrete tokens are emitted by the (forthcoming) multimodal
-            # preprocessor; this is only used for chat-template rendering.
-            return ""
-        return None
-
-    def get_language_model(self) -> nn.Module:
-        return self.model
-
-    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
-        """Turn precomputed per-frame ``audio_codes`` into the additive
-        embedding bias.
-
-        Expected kwarg: ``audio_codes`` shape ``(num_audios, n_frames,
-        num_codebooks)`` or a list of per-audio tensors. The Mimi codec
-        runs ahead of vLLM in the multimodal preprocessor; this method
-        does *not* run a neural network — it's a fixed table lookup
-        followed by a sum.
+        Audio bias is supplied by the caller (currently via precomputed
+        ``inputs_embeds``); the future multimodal-processor path will add
+        it through the ``SupportsMultiModal`` machinery.
         """
-        audio_codes = kwargs.pop("audio_codes", None)
-        if audio_codes is None:
-            return []
-
-        if isinstance(audio_codes, torch.Tensor):
-            items: Iterable[torch.Tensor] = audio_codes.unbind(0)
-        else:
-            items = audio_codes
-
-        embed = self.model.embed_tokens
-        out: list[torch.Tensor] = []
-        for codes in items:
-            # codes: (n_frames, num_codebooks)
-            out.append(embed.embed_audio_only(codes))
-        return out
-
-    def embed_input_ids(
-        self,
-        input_ids: torch.Tensor,
-        multimodal_embeddings: MultiModalEmbeddings | None = None,
-        *,
-        is_multimodal: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Compose the input embedding from text + audio bias.
-
-        Kyutai STT *adds* the per-frame audio bias to the text embedding
-        at every audio-frame position, rather than the standard vLLM
-        replace-at-placeholder pattern. We therefore override the default
-        ``SupportsMultiModal.embed_input_ids`` to do an additive merge.
-
-        At positions flagged by ``is_multimodal``, the contract is::
-
-            inputs_embeds[i] = embed_text(input_ids[i]) + audio_bias[k]
-
-        where ``k`` indexes the corresponding row in
-        ``multimodal_embeddings``. This is correct for the *prefill /
-        placeholder* path; see the module docstring for the open
-        autoregressive-decode question.
-        """
-        text_embeds = self.model.embed_input_ids(input_ids)
-
-        if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
-            return text_embeds
-        if is_multimodal is None:
-            return text_embeds
-
-        # Flatten the list-of-tensors mm bundle into a single (M, H) tensor
-        # in the order the runner expects.
-        if isinstance(multimodal_embeddings, torch.Tensor):
-            mm_flat = multimodal_embeddings.reshape(-1, multimodal_embeddings.shape[-1])
-        else:
-            mm_flat = torch.cat(
-                [t.reshape(-1, t.shape[-1]) for t in multimodal_embeddings],
-                dim=0,
-            )
-
-        is_mm = is_multimodal.to(device=text_embeds.device, non_blocking=True)
-        text_embeds[is_mm] = text_embeds[is_mm] + mm_flat.to(dtype=text_embeds.dtype)
-        return text_embeds
+        return self.model.embed_input_ids(input_ids)
 
     # -------------------------------------------------------------------
     # Forward / logits / weights
