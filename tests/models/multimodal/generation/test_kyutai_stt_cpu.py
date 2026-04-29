@@ -162,9 +162,12 @@ def test_embedding_matches_transformers_reference():
     hf = HFEmb(cfg)
     vmod = VEmb(cfg)
 
-    # Share weights.
+    # Share weights. ``VocabParallelEmbedding`` pads the vocab dim up to a
+    # multiple of ``DEFAULT_VOCAB_PADDING_SIZE`` (64); copy into the
+    # un-padded prefix.
     with torch.no_grad():
-        vmod.weight.copy_(hf.embed_tokens.weight)
+        n_rows = hf.embed_tokens.weight.shape[0]
+        vmod.weight.data[:n_rows].copy_(hf.embed_tokens.weight)
 
     text_ids = torch.randint(0, cfg.vocab_size, (2, 5), dtype=torch.long)
     audio_codes = torch.randint(
@@ -193,7 +196,7 @@ def test_load_weights_remaps_hf_state_dict():
     """
     from types import SimpleNamespace
 
-    from vllm.config import CacheConfig, ModelConfig, VllmConfig
+    from vllm.config import ModelConfig, VllmConfig
     from vllm.model_executor.models.kyutai_speech_to_text import (
         KyutaiSpeechToTextForConditionalGeneration,
     )
@@ -224,12 +227,13 @@ def test_load_weights_remaps_hf_state_dict():
     model_config.hf_config = config
     model_config.dtype = torch.float32
 
-    vllm_config = VllmConfig.__new__(VllmConfig)
+    vllm_config = VllmConfig()
     vllm_config.model_config = model_config
-    vllm_config.cache_config = CacheConfig.__new__(CacheConfig)
-    vllm_config.quant_config = None
 
-    model = KyutaiSpeechToTextForConditionalGeneration(vllm_config=vllm_config)
+    from vllm.config import set_current_vllm_config
+
+    with set_current_vllm_config(vllm_config):
+        model = KyutaiSpeechToTextForConditionalGeneration(vllm_config=vllm_config)
 
     hsz = config.hidden_size
     isz = config.intermediate_size
