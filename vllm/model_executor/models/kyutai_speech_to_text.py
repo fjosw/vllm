@@ -82,7 +82,6 @@ from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
     BaseMultiModalProcessor,
     BaseProcessingInfo,
-    PromptReplacement,
     PromptUpdate,
 )
 from vllm.sequence import IntermediateTensors
@@ -424,14 +423,6 @@ def _resolve_frame_size(config) -> int:
 # -----------------------------------------------------------------------------
 
 
-_AUDIO_PLACEHOLDER = "<|kyutai_audio|>"
-"""Sentinel substring inserted by :class:`KyutaiSttDummyInputsBuilder` and
-:meth:`KyutaiSpeechToTextForConditionalGeneration.get_placeholder_str`.
-The :class:`KyutaiSttMultiModalProcessor` rewrites it into the right
-number of ``audio_pad_token_id`` placeholder ids based on the audio
-length."""
-
-
 class KyutaiSttProcessingInfo(BaseProcessingInfo):
     def get_hf_processor(self, **kwargs: object):
         # The HF processor wraps tokenizer + KyutaiSpeechToTextFeatureExtractor.
@@ -464,7 +455,9 @@ class KyutaiSttProcessingInfo(BaseProcessingInfo):
 
 class KyutaiSttDummyInputsBuilder(BaseDummyInputsBuilder[KyutaiSttProcessingInfo]):
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
-        return _AUDIO_PLACEHOLDER * mm_counts.get("audio", 0)
+        # The audio-frame placeholders are inserted by the multimodal
+        # processor; no string placeholder is needed here.
+        return ""
 
     def get_dummy_mm_data(
         self,
@@ -506,23 +499,19 @@ class KyutaiSttMultiModalProcessor(BaseMultiModalProcessor[KyutaiSttProcessingIn
     ) -> BatchFeature:
         audios = mm_data.get("audios") or mm_data.get("audio") or []
         tok = self.info.get_tokenizer()
-        text_no_placeholders = prompt.replace(_AUDIO_PLACEHOLDER, "")
-        prompt_ids = tok.encode(text_no_placeholders) if text_no_placeholders else []
+        prompt_ids = tok.encode(prompt) if prompt else []
 
         if not audios:
-            # Text-only is not the intended usage but keep the path open.
             return BatchFeature({"input_ids": [prompt_ids]}, tensor_type="pt")
 
         fe = self.info.get_feature_extractor()
-        # ``audios`` is a list[np.ndarray]; the FE returns ``input_values``
-        # padded with the configured silence prefix + audio delay.
         out = fe(
             list(audios),
             sampling_rate=fe.sampling_rate,
             return_tensors="pt",
             padding=True,
         )
-        input_values = out["input_values"]  # (n_audios, 1, n_samples)
+        input_values = out["input_values"]
         return BatchFeature(
             {"input_values": input_values, "input_ids": [prompt_ids]},
             tensor_type="pt",
@@ -543,12 +532,18 @@ class KyutaiSttMultiModalProcessor(BaseMultiModalProcessor[KyutaiSttProcessingIn
         hf_processor_mm_kwargs: Mapping[str, object],
         out_mm_kwargs: MultiModalKwargsItems,
     ) -> Sequence[PromptUpdate]:
+        from vllm.multimodal.processing import (
+            PromptIndexTargets,
+            PromptInsertion,
+        )
+
         cfg = self.info.ctx.model_config.hf_config
         frame_size = _resolve_frame_size(cfg.codec_config)
         audio_pad = int(cfg.audio_pad_token_id)
+        bos = int(cfg.bos_token_id)
         out_audio = out_mm_kwargs.require_data().get("audio", [])
 
-        def get_replacement(item_idx: int):
+        def get_insertion(item_idx: int):
             input_values = out_audio[item_idx].get_data()["input_values"]
             n_samples = (
                 input_values.shape[-1]
@@ -556,13 +551,14 @@ class KyutaiSttMultiModalProcessor(BaseMultiModalProcessor[KyutaiSttProcessingIn
                 else int(np.asarray(input_values).shape[-1])
             )
             n_frames = max(1, int(n_samples) // frame_size)
-            return [audio_pad] * n_frames
+            # BOS token at position 0, then N audio-frame placeholders.
+            return [bos] + [audio_pad] * n_frames
 
         return [
-            PromptReplacement(
+            PromptInsertion(
                 modality="audio",
-                target=_AUDIO_PLACEHOLDER,
-                replacement=get_replacement,
+                target=PromptIndexTargets.start(),
+                insertion=get_insertion,
             )
         ]
 
@@ -671,8 +667,9 @@ class KyutaiSpeechToTextForConditionalGeneration(
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
-        if modality.startswith("audio"):
-            return _AUDIO_PLACEHOLDER
+        # Audio-frame placeholder ids are inserted by the multimodal
+        # processor via PromptInsertion at the start of the prompt; we
+        # don't need a textual placeholder for the chat template.
         return None
 
     def get_language_model(self) -> nn.Module:
