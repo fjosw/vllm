@@ -586,7 +586,15 @@ class KyutaiSttMultiModalProcessor(BaseMultiModalProcessor[KyutaiSttProcessingIn
 
         cfg = self.info.ctx.model_config.hf_config
         frame_size = _resolve_frame_size(cfg.codec_config)
-        audio_pad = int(cfg.audio_pad_token_id)
+        # Use an in-vocab placeholder id so vLLM's sampler can fetch
+        # ``prompt_logprobs`` at every audio-frame position (the OOV
+        # ``audio_pad_token_id`` would index out of the LM head). The
+        # actual embedding row is irrelevant: the standard
+        # ``_merge_multimodal_embeddings`` overwrites placeholder
+        # positions with the per-frame audio bias, so the final embedding
+        # equals ``audio_bias`` regardless of the placeholder's text-vocab
+        # row content.
+        audio_pad = int(getattr(cfg, "pad_token_id", 0) or 0)
         out_audio = out_mm_kwargs.require_data().get("audio", [])
 
         def get_insertion(item_idx: int):
@@ -702,14 +710,18 @@ class KyutaiSpeechToTextForConditionalGeneration(
         text_vocab = int(getattr(config, "text_vocab_size", config.vocab_size))
         self._text_vocab_size = text_vocab
 
-        # ``audio_pad_token_id`` is the multimodal placeholder we insert at
-        # every audio-frame position; it lives in the *combined* embedding
-        # table (text vocab + per-codebook ranges + 1 pad row) which is
-        # wider than the text vocab. Inform vLLM so it masks these OOV
-        # ids before the text embedding lookup.
+        # The audio-frame placeholder used by the multimodal processor
+        # is the model's text-vocab pad token (``pad_token_id``). It is
+        # *not* OOV w.r.t. the text vocab, so vLLM's sampler can fetch
+        # ``prompt_logprobs`` at every prompt position (the value at
+        # placeholder positions is meaningless — those embeddings are
+        # overwritten by the audio bias in
+        # :meth:`embed_input_ids` — but the lookup machinery is what
+        # the standard pipeline assumes).
+        placeholder_id = int(getattr(config, "pad_token_id", 0) or 0)
         self.configure_mm_token_handling(
             vocab_size=text_vocab,
-            mm_token_ids=[int(config.audio_pad_token_id)],
+            mm_token_ids=[placeholder_id],
         )
 
         if get_pp_group().is_last_rank:
