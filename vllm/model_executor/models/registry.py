@@ -447,6 +447,10 @@ _MULTIMODAL_MODELS = {
     ),
     "KimiVLForConditionalGeneration": ("kimi_vl", "KimiVLForConditionalGeneration"),
     "KimiK25ForConditionalGeneration": ("kimi_k25", "KimiK25ForConditionalGeneration"),
+    "KyutaiSpeechToTextForConditionalGeneration": (
+        "kyutai_speech_to_text",
+        "KyutaiSpeechToTextForConditionalGeneration",
+    ),
     "MoonshotKimiaForCausalLM": ("kimi_audio", "KimiAudioForConditionalGeneration"),
     "LightOnOCRForConditionalGeneration": (
         "lightonocr",
