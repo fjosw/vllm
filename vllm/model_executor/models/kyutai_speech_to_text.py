@@ -172,24 +172,32 @@ class KyutaiSpeechToTextEmbeddings(VocabParallelEmbedding):
 # -----------------------------------------------------------------------------
 
 
-def _ensure_sliding_layer_types(config) -> None:
-    """Tell vLLM's ``LlamaAttention`` to enable per-layer sliding window.
+def _bridge_kyutai_config(config) -> None:
+    """Plug small naming gaps between the HF Kyutai config and vLLM's
+    ``LlamaDecoderLayer`` / ``LlamaAttention`` expectations.
 
-    ``LlamaAttention`` reads ``config.layer_types`` and turns sliding
-    window on for the layers tagged ``"sliding_attention"``. The Kyutai
-    HF config carries ``sliding_window`` but no ``layer_types`` array
-    (every layer is sliding-window). We synthesize the array once, here,
-    so the generic LLaMA path picks it up. This is idempotent and is a
-    pattern used by other vLLM models that wrap a config without
-    ``layer_types`` (the alternative — rebuilding ``self.attn`` after
-    super().__init__ — is fragile because ``Attention.impl`` captures
-    the sliding window at construction time).
+    * ``config.intermediate_size`` is what vLLM's ``LlamaMLP`` reads;
+      Kyutai's HF config calls it ``ffn_dim`` and stores the *merged*
+      gate+up dim (so the actual SwiGLU intermediate is ``ffn_dim // 2``).
+    * ``config.layer_types`` is what vLLM's ``LlamaAttention`` reads to
+      enable per-layer sliding window. Kyutai applies the same window to
+      every layer so we synthesize the list here.
+
+    Both fixes are idempotent. Mutating the shared HF config object is
+    consistent with how other vLLM model wrappers (Voxtral, Qwen2-Audio,
+    ...) bridge their configs.
     """
-    if getattr(config, "sliding_window", None) is None:
-        return
-    if getattr(config, "layer_types", None):
-        return
-    config.layer_types = ["sliding_attention"] * config.num_hidden_layers
+    if not hasattr(config, "intermediate_size") or config.intermediate_size is None:
+        ffn_dim = getattr(config, "ffn_dim", None)
+        if ffn_dim is not None:
+            if ffn_dim % 2 != 0:
+                raise ValueError(f"ffn_dim={ffn_dim} must be even (gate and up halves)")
+            config.intermediate_size = ffn_dim // 2
+
+    if getattr(config, "sliding_window", None) is not None and not getattr(
+        config, "layer_types", None
+    ):
+        config.layer_types = ["sliding_attention"] * config.num_hidden_layers
 
 
 # -----------------------------------------------------------------------------
@@ -204,7 +212,7 @@ class KyutaiSpeechToTextModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
-        _ensure_sliding_layer_types(config)
+        _bridge_kyutai_config(config)
         quant_config = vllm_config.quant_config
 
         self.config = config
