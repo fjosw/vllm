@@ -585,7 +585,11 @@ class KyutaiSttMultiModalProcessor(BaseMultiModalProcessor[KyutaiSttProcessingIn
                 if isinstance(input_values, torch.Tensor)
                 else int(np.asarray(input_values).shape[-1])
             )
-            n_frames = max(1, int(n_samples) // frame_size)
+            # Mimi's encoder pads its input and emits ceil(n / frame_size)
+            # frames, so we mirror the same rounding here. Mismatching the
+            # placeholder count vs. the codec's output length triggers a
+            # scatter-out-of-bounds in ``_merge_multimodal_embeddings``.
+            n_frames = max(1, -(-int(n_samples) // frame_size))
             # BOS token at position 0, then N audio-frame placeholders.
             return [bos] + [audio_pad] * n_frames
 
