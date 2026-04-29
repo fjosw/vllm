@@ -64,6 +64,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.llama import LlamaDecoderLayer
 from vllm.sequence import IntermediateTensors
 
@@ -286,6 +287,69 @@ class KyutaiSpeechToTextModel(nn.Module):
 
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Load the LM backbone weights, with the qkv stack and gate/up
+        chunk-split handled here.
+
+        ``MergedColumnParallelLinear``'s weight loader expects either two
+        separate shard loads (gate then up) or one fused load with
+        ``loaded_shard_id=None``; the HF Kyutai checkpoint provides a
+        single fused ``mlp.fc1.weight`` (already in the gate-first layout
+        we expect), so we chunk-split it into the two shards. The
+        ``q/k/v_proj.linear.weight`` keys are the generic LLaMA-style
+        per-projection tensors that ``QKVParallelLinear`` consumes via
+        ``shard_id`` "q"/"k"/"v".
+        """
+        stacked_params_mapping: list[tuple[str, str, str | int]] = [
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+        ]
+        params_dict = dict(self.named_parameters())
+        loaded: set[str] = set()
+
+        for name, weight in weights:
+            # Chunk-split the merged HF MLP weight into vLLM's
+            # ``gate_up_proj`` (gate, up) shards.
+            if name.endswith(".mlp.gate_up_proj.weight"):
+                if name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                gate, up = weight.chunk(2, dim=0)
+                weight_loader(param, gate, 0)
+                weight_loader(param, up, 1)
+                loaded.add(name)
+                continue
+
+            handled = False
+            for stacked_name, shard_name, shard_id in stacked_params_mapping:
+                if shard_name not in name:
+                    continue
+                target = name.replace(shard_name, stacked_name)
+                if target not in params_dict:
+                    handled = True
+                    break
+                param = params_dict[target]
+                param.weight_loader(param, weight, shard_id)
+                loaded.add(target)
+                handled = True
+                break
+            if handled:
+                continue
+
+            if name not in params_dict:
+                # Unknown extra keys (e.g. registered buffers, dropped
+                # by the WeightsMapper, or ``codec_model.*`` entries
+                # that shouldn't reach us) are ignored.
+                continue
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, weight)
+            loaded.add(name)
+
+        return loaded
 
 
 # -----------------------------------------------------------------------------
