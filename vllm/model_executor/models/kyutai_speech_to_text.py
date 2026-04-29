@@ -142,8 +142,12 @@ class KyutaiSpeechToTextEmbeddings(VocabParallelEmbedding):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
+        text_vocab = int(getattr(config, "text_vocab_size", config.vocab_size))
+        # ``config.vocab_size`` may have been widened to the full embedding
+        # table size by ``_bridge_kyutai_config``; either way, the table
+        # holds ``text_vocab + N*V + 1`` rows.
         num_embeddings = (
-            config.vocab_size + config.num_codebooks * config.codebook_vocab_size + 1
+            text_vocab + config.num_codebooks * config.codebook_vocab_size + 1
         )
         super().__init__(
             num_embeddings=num_embeddings,
@@ -151,14 +155,13 @@ class KyutaiSpeechToTextEmbeddings(VocabParallelEmbedding):
             quant_config=quant_config,
             prefix=prefix,
         )
-        self.text_vocab_size = config.vocab_size
+        self.text_vocab_size = text_vocab
         self.codebook_vocab_size = config.codebook_vocab_size
         self.num_codebooks = config.num_codebooks
         self.audio_pad_token_id = config.audio_pad_token_id
 
         codebook_offsets = (
-            torch.arange(config.num_codebooks) * config.codebook_vocab_size
-            + config.vocab_size
+            torch.arange(config.num_codebooks) * config.codebook_vocab_size + text_vocab
         )
         self.register_buffer("codebook_offsets", codebook_offsets, persistent=False)
 
@@ -195,7 +198,7 @@ class KyutaiSpeechToTextEmbeddings(VocabParallelEmbedding):
 
 def _bridge_kyutai_config(config) -> None:
     """Plug small naming gaps between the HF Kyutai config and vLLM's
-    ``LlamaDecoderLayer`` / ``LlamaAttention`` expectations.
+    ``LlamaDecoderLayer`` / ``LlamaAttention`` / runtime expectations.
 
     * ``config.intermediate_size`` is what vLLM's ``LlamaMLP`` reads;
       Kyutai's HF config calls it ``ffn_dim`` and stores the *merged*
@@ -203,11 +206,29 @@ def _bridge_kyutai_config(config) -> None:
     * ``config.layer_types`` is what vLLM's ``LlamaAttention`` reads to
       enable per-layer sliding window. Kyutai applies the same window to
       every layer so we synthesize the list here.
+    * ``config.rope_parameters`` is bundled from the top-level
+      ``rope_theta`` (see below).
+    * ``config.vocab_size`` is widened to the *embedding table* extent
+      (``text_vocab + num_codebooks * codebook_vocab + 1``) so that
+      vLLM's OOV validator accepts the BOS (48000), audio-pad (69569),
+      and codebook offsets — all of which are valid rows in the model's
+      embedding table even though they are *not* valid LM-head outputs.
+      The original text-vocab size is preserved as ``text_vocab_size``
+      and used to size the LM head.
 
-    Both fixes are idempotent. Mutating the shared HF config object is
-    consistent with how other vLLM model wrappers (Voxtral, Qwen2-Audio,
-    ...) bridge their configs.
+    All fixes are idempotent.
     """
+    # Widen vocab_size to the full embedding-table extent for input
+    # validation; preserve the original text vocab size for the LM head.
+    if not hasattr(config, "text_vocab_size") or config.text_vocab_size is None:
+        config.text_vocab_size = int(config.vocab_size)
+        full_size = (
+            config.text_vocab_size
+            + int(config.num_codebooks) * int(config.codebook_vocab_size)
+            + 1
+        )
+        config.vocab_size = full_size
+
     if not hasattr(config, "intermediate_size") or config.intermediate_size is None:
         ffn_dim = getattr(config, "ffn_dim", None)
         if ffn_dim is not None:
@@ -644,26 +665,32 @@ class KyutaiSpeechToTextForConditionalGeneration(
         # ``embed_multimodal``).
         self.codec_model = MimiModel(config.codec_config)
 
+        # The LM head outputs over the *text* vocab only (audio codebook
+        # rows in the embedding table aren't sampled). Use the preserved
+        # ``text_vocab_size`` from the bridge.
+        text_vocab = int(getattr(config, "text_vocab_size", config.vocab_size))
+        self._text_vocab_size = text_vocab
+
         # ``audio_pad_token_id`` is the multimodal placeholder we insert at
         # every audio-frame position; it lives in the *combined* embedding
-        # table (vocab + per-codebook ranges + 1 pad row) which is wider
-        # than ``config.vocab_size`` (the text vocab). Inform vLLM so it
-        # masks these OOV ids before the text embedding lookup.
+        # table (text vocab + per-codebook ranges + 1 pad row) which is
+        # wider than the text vocab. Inform vLLM so it masks these OOV
+        # ids before the text embedding lookup.
         self.configure_mm_token_handling(
-            vocab_size=config.vocab_size,
+            vocab_size=text_vocab,
             mm_token_ids=[int(config.audio_pad_token_id)],
         )
 
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
-                config.vocab_size,
+                text_vocab,
                 config.hidden_size,
                 quant_config=vllm_config.quant_config,
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
             if getattr(config, "tie_word_embeddings", False):
                 self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
-            self.logits_processor = LogitsProcessor(config.vocab_size)
+            self.logits_processor = LogitsProcessor(text_vocab)
         else:
             self.lm_head = PPMissingLayer()
 
