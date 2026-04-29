@@ -42,6 +42,42 @@ _HAS_VLLM = _can_import("vllm")
 _HAS_TRANSFORMERS_KYUTAI = _can_import("transformers.models.kyutai_speech_to_text")
 
 
+@pytest.fixture(autouse=True)
+def _vllm_dist_init():
+    """Initialize vLLM's distributed/model-parallel state.
+
+    ``KyutaiSpeechToTextEmbeddings`` is a ``VocabParallelEmbedding``, which
+    asserts that the parallel groups exist. We bring them up once per
+    test (TP=1, PP=1) and tear down afterwards. No-op when vLLM is not
+    importable.
+    """
+    if not _HAS_VLLM:
+        yield
+        return
+
+    import tempfile
+
+    from vllm.distributed import (
+        cleanup_dist_env_and_memory,
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+
+    init_file = tempfile.mkstemp()[1]
+    init_distributed_environment(
+        world_size=1,
+        rank=0,
+        distributed_init_method=f"file://{init_file}",
+        local_rank=0,
+        backend="gloo",
+    )
+    initialize_model_parallel(1, 1)
+    try:
+        yield
+    finally:
+        cleanup_dist_env_and_memory()
+
+
 # -----------------------------------------------------------------------------
 # Embedding parity
 # -----------------------------------------------------------------------------
