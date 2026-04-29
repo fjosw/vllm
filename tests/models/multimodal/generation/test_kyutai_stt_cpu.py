@@ -65,15 +65,15 @@ def _vllm_dist_init():
     )
 
     init_file = tempfile.mkstemp()[1]
-    init_distributed_environment(
-        world_size=1,
-        rank=0,
-        distributed_init_method=f"file://{init_file}",
-        local_rank=0,
-        backend="gloo",
-    )
-    initialize_model_parallel(1, 1)
     with set_current_vllm_config(VllmConfig()):
+        init_distributed_environment(
+            world_size=1,
+            rank=0,
+            distributed_init_method=f"file://{init_file}",
+            local_rank=0,
+            backend="gloo",
+        )
+        initialize_model_parallel(1, 1)
         try:
             yield
         finally:
