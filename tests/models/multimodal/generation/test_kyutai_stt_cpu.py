@@ -57,6 +57,7 @@ def _vllm_dist_init():
 
     import tempfile
 
+    from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.distributed import (
         cleanup_dist_env_and_memory,
         init_distributed_environment,
@@ -72,10 +73,11 @@ def _vllm_dist_init():
         backend="gloo",
     )
     initialize_model_parallel(1, 1)
-    try:
-        yield
-    finally:
-        cleanup_dist_env_and_memory()
+    with set_current_vllm_config(VllmConfig()):
+        try:
+            yield
+        finally:
+            cleanup_dist_env_and_memory()
 
 
 # -----------------------------------------------------------------------------
