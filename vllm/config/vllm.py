@@ -1038,11 +1038,19 @@ class VllmConfig:
                     self.compilation_config.cudagraph_mode.has_full_cudagraphs()
                     and model_config.pooler_config is not None
                 ):
-                    logger.warning_once(
-                        "Pooling models do not support full cudagraphs. "
-                        "Overriding cudagraph_mode to PIECEWISE."
-                    )
-                    self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+                    if model_config.attn_type == "encoder_only":
+                        # Encoder-only pooling models run a single
+                        # bidirectional forward per request, with no
+                        # decode loop. Full cudagraphs capture that
+                        # forward end-to-end, removing the per-step
+                        # host overhead piecewise mode keeps.
+                        pass
+                    else:
+                        logger.warning_once(
+                            "Pooling models do not support full cudagraphs. "
+                            "Overriding cudagraph_mode to PIECEWISE."
+                        )
+                        self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
                 elif (
                     model_config.is_encoder_decoder
                     and self.compilation_config.cudagraph_mode
