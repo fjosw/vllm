@@ -85,8 +85,21 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
         # from streamed output.
         if self.stop and not self.include_stop_str_in_output:
             self.stop_buffer_length = max(len(s) for s in self.stop) - 1
+            # Proper prefixes of the stop strings, keyed by their last char,
+            # longest first. Bounds the per-step holdback scan to the
+            # prefixes that can end at the current text tail.
+            prefix_map: dict[str, list[str]] = {}
+            for s in self.stop:
+                for k in range(1, len(s)):
+                    prefixes = prefix_map.setdefault(s[k - 1], [])
+                    if s[:k] not in prefixes:
+                        prefixes.append(s[:k])
+            for prefixes in prefix_map.values():
+                prefixes.sort(key=len, reverse=True)
+            self._stop_prefix_map = prefix_map
         else:
             self.stop_buffer_length = 0
+            self._stop_prefix_map = {}
         self._last_output_text_offset: int = 0
 
         # Generation data
@@ -168,22 +181,20 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
         string match and must not be released yet.
 
         This is the length of the longest suffix of output_text that is a
-        proper prefix of a stop string (at most stop_buffer_length). Usually
-        0, which lets the cumulative path return output_text without copying
-        the whole string on every step.
+        proper prefix of a stop string. Usually 0, which lets the cumulative
+        path return output_text without copying the whole string on every
+        step.
         """
-        if not self.stop_buffer_length:
-            return 0
         text = self.output_text
-        overlap = 0
-        for s in self.stop:
-            k = min(len(s) - 1, len(text))
-            while k > overlap:
-                if text.endswith(s[:k]):
-                    overlap = k
-                    break
-                k -= 1
-        return overlap
+        if not text or not self._stop_prefix_map:
+            return 0
+        prefixes = self._stop_prefix_map.get(text[-1])
+        if prefixes is None:
+            return 0
+        for prefix in prefixes:
+            if text.endswith(prefix):
+                return len(prefix)
+        return 0
 
 
 class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
