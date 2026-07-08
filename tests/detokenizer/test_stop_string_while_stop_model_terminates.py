@@ -99,3 +99,45 @@ def test_stop_string_while_stop_token_terminates(include_stop_str_in_output: boo
     # get_next_output_text should return the full text when finished=True.
     # (Buffering only applies during streaming when finished=False.)
     assert detok.get_next_output_text(finished=True, delta=False) == expected_text
+
+
+def test_stop_string_holdback_only_when_tail_overlaps():
+    """Cumulative-mode output must release all text (returning the internal
+    string without a copy) unless the text tail could still start a stop
+    string match; only the overlapping suffix is held back."""
+    d = _DummyDetokenizer(
+        _make_request(stop=["STOP"], include_stop_str_in_output=False)
+    )
+
+    d.update([ord(c) for c in "hello "], False)
+    # No suffix of "hello " is a prefix of "STOP": nothing is held back and
+    # no per-step copy of the full text is made.
+    assert d.get_next_output_text(finished=False, delta=False) is d.output_text
+
+    d.update([ord(c) for c in "worldST"], False)
+    # "ST" could still complete "STOP" and must be held back.
+    assert d.get_next_output_text(finished=False, delta=False) == "hello world"
+
+    d.update([ord(c) for c in "AY"], False)
+    # The overlap was broken: everything is released again.
+    assert d.get_next_output_text(finished=False, delta=False) is d.output_text
+    assert d.output_text == "hello worldSTAY"
+
+
+def test_stop_string_holdback_delta_stream_never_retracts():
+    """Delta-mode streaming with dynamic holdback must emit each char exactly
+    once and never emit chars that a later stop match truncates away."""
+    d = _DummyDetokenizer(
+        _make_request(stop=["STOP"], include_stop_str_in_output=False)
+    )
+
+    d.update([ord(c) for c in "abcST"], False)
+    assert d.get_next_output_text(finished=False, delta=True) == "abc"
+
+    d.update([ord(c) for c in "xy"], False)
+    assert d.get_next_output_text(finished=False, delta=True) == "STxy"
+
+    stop = d.update([ord(c) for c in "STOP"], False)
+    assert stop == "STOP"
+    assert d.output_text == "abcSTxy"
+    assert d.get_next_output_text(finished=True, delta=True) == ""

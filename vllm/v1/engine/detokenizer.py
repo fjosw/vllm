@@ -150,7 +150,7 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
         this method is returned"""
 
         # We return the full output text if the sequence is finished.
-        buffer_length = 0 if finished else self.stop_buffer_length
+        buffer_length = 0 if finished else self._holdback_length()
         if not delta:
             if not buffer_length:
                 return self.output_text
@@ -162,6 +162,28 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
             self._last_output_text_offset = length
             return self.output_text[last_offset:length]
         return ""
+
+    def _holdback_length(self) -> int:
+        """Number of trailing chars that could still become part of a stop
+        string match and must not be released yet.
+
+        This is the length of the longest suffix of output_text that is a
+        proper prefix of a stop string (at most stop_buffer_length). Usually
+        0, which lets the cumulative path return output_text without copying
+        the whole string on every step.
+        """
+        if not self.stop_buffer_length:
+            return 0
+        text = self.output_text
+        overlap = 0
+        for s in self.stop:
+            k = min(len(s) - 1, len(text))
+            while k > overlap:
+                if text.endswith(s[:k]):
+                    overlap = k
+                    break
+                k -= 1
+        return overlap
 
 
 class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
