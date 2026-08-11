@@ -152,8 +152,9 @@ class DiffusionGemmaForConditionalGeneration(
 
     Always includes a vision tower (same as Gemma4) for image understanding.
 
-    In practice, the model's forward() dispatches based on the `mode` kwarg
-    set by DiffusionGemmaModelState.prepare_inputs().
+    Mode dispatch is driven by DiffusionGemmaModelState: per-request causal
+    flags in prepare_attn (encoder=causal / denoise=bidirectional) and
+    self-conditioning embeddings applied in prepare_inputs.
     """
 
     hf_to_vllm_mapper = WeightsMapper(
@@ -263,17 +264,6 @@ class DiffusionGemmaForConditionalGeneration(
             self_conditioning_size=sc_size,
             eps=getattr(text_config, "rms_norm_eps", 1e-6),
         )
-
-    def compute_self_conditioning(
-        self,
-        inputs_embeds: torch.Tensor,
-        probs: torch.Tensor,
-    ) -> torch.Tensor:
-        embed_weight = self.model.embed_tokens.weight
-        soft_embeds = torch.matmul(
-            probs.to(embed_weight.dtype), embed_weight
-        ) * self.model.normalizer.to(inputs_embeds.dtype)
-        return self.self_conditioning(inputs_embeds, soft_embeds)
 
     # ------------------------------------------------------------------ #
     # Multimodal: reuse Gemma4's image parsing, processing & embedding
@@ -709,13 +699,6 @@ class DiffusionGemmaRequestStates:
             max_num_reqs, canvas_length, dtype=torch.int64, device=device
         )
 
-        # Per-slot prompt length (set by add_request).
-        self.prompt_len = torch.zeros(
-            max_num_reqs,
-            dtype=torch.int32,
-            device=device,
-        )
-
         # Per-slot confidence flag, set by the sampler each step.
         self.confident = torch.zeros(max_num_reqs, dtype=torch.bool, device=device)
 
@@ -781,6 +764,12 @@ class DiffusionGemmaModelState(ModelState):
 
         text_config = self.model_config.hf_text_config
         self.gen_config = self.model_config.try_get_generation_config()
+        stability_threshold = self.gen_config.get("stability_threshold")
+        if not isinstance(stability_threshold, int) or stability_threshold < 0:
+            raise ValueError(
+                "DiffusionGemma requires an integer stability_threshold >= 0 "
+                f"in generation_config.json (got {stability_threshold!r})"
+            )
         max_denoising_steps = (
             diffusion_config.max_denoising_steps if diffusion_config else None
         ) or self.gen_config.get("max_denoising_steps", 48)
@@ -794,14 +783,17 @@ class DiffusionGemmaModelState(ModelState):
             # In Transformers, `stability_threshold=1` (the default) means the current
             # step must match the previous step. In vLLM, the history buffer includes
             # the current step, so we add 1 to match the same behavior.
-            stability_threshold=self.gen_config["stability_threshold"] + 1,
+            stability_threshold=stability_threshold + 1,
         )
         self._req_id_to_index: dict[str, int] = {}
 
-        # Persistent buffer for per-request causal flags, updated in-place
-        # so FULL CUDA graph replay sees the latest values.
+        # Persistent per-request causal flags, updated in-place so FULL CUDA
+        # graph replay reads the latest values at the captured address. int32:
+        # FA4's per-sequence causal requires it, and this keeps the attention
+        # metadata builder from re-materializing the tensor per step (which
+        # would leave the captured kernel reading a stale pointer).
         self._causal_buf = torch.zeros(
-            self.max_num_reqs, dtype=torch.bool, device=device
+            self.max_num_reqs, dtype=torch.int32, device=device
         )
 
         # Persistent inputs_embeds buffer — required so FULL CUDA graph
@@ -829,6 +821,23 @@ class DiffusionGemmaModelState(ModelState):
             raise ValueError(
                 f"entropy_bound must be a positive float (got {entropy_bound})"
             )
+        t_min = gen.get("t_min")
+        t_max = gen.get("t_max")
+        confidence_threshold = gen.get("confidence_threshold")
+        if t_min is None or t_max is None or confidence_threshold is None:
+            raise ValueError(
+                "DiffusionGemma requires t_min, t_max, and confidence_threshold "
+                "in generation_config.json"
+            )
+        if not (0 <= t_min < t_max):
+            raise ValueError(
+                f"expected 0 <= t_min < t_max (got t_min={t_min}, t_max={t_max})"
+            )
+        if not confidence_threshold > 0:
+            raise ValueError(
+                "confidence_threshold must be a positive float "
+                f"(got {confidence_threshold})"
+            )
         # The self-conditioning matmul (probs @ embed_tokens.weight) runs over a
         # vocab-parallel embedding shard. Hand the sampler this rank's vocab
         # slice and TP group so it can all-reduce the partial products.
@@ -840,10 +849,10 @@ class DiffusionGemmaModelState(ModelState):
             diffusion_config=diffusion_config,
             vocab_size=self.model_config.get_vocab_size(),
             diffusion_states=self.diffusion_states,
-            t_min=gen["t_min"],
-            t_max=gen["t_max"],
+            t_min=t_min,
+            t_max=t_max,
             entropy_bound=entropy_bound,
-            confidence_threshold=gen["confidence_threshold"],
+            confidence_threshold=confidence_threshold,
             embed_weight=embed_tokens.weight,
             normalizer=self.model.model.normalizer,
             sc_vocab_start=shard.org_vocab_start_index,
@@ -858,9 +867,6 @@ class DiffusionGemmaModelState(ModelState):
     def add_request(self, req_index: int, new_req_data: Any) -> None:
         self._req_id_to_index[new_req_data.req_id] = req_index
         self.diffusion_states.add_request(req_index)
-        if not new_req_data.req_id.startswith("_warmup_"):
-            prompt_len = len(new_req_data.prompt_token_ids)
-            self.diffusion_states.prompt_len[req_index] = prompt_len
 
     def remove_request(self, req_id: str) -> None:
         idx = self._req_id_to_index.pop(req_id, None)
@@ -1000,11 +1006,11 @@ class DiffusionGemmaModelState(ModelState):
         # Invariant: the sampler flips is_encoder_phase to False only after a
         # request's FINAL prompt chunk, so a prompt spanning multiple chunks
         # (longer than the token budget) stays causal for every chunk.
-        self._causal_buf[:actual_num_reqs] = self.diffusion_states.is_encoder_phase[
-            slots
-        ]
+        self._causal_buf[:actual_num_reqs].copy_(
+            self.diffusion_states.is_encoder_phase[slots]
+        )
         if actual_num_reqs < num_reqs:
-            self._causal_buf[actual_num_reqs:num_reqs] = False
+            self._causal_buf[actual_num_reqs:num_reqs] = 0
         causal: bool | torch.Tensor = self._causal_buf[:num_reqs]
 
         return build_attn_metadata(
@@ -1094,6 +1100,13 @@ class DiffusionSampler:
             dtype=torch.int32,
             device=device,
         )
+        # Read-only zeros for prefill batches' num_rejected; never aliased
+        # with num_sampled so downstream in-place use can corrupt neither.
+        self._num_rejected_prefill = torch.zeros(
+            max_num_reqs,
+            dtype=torch.int32,
+            device=device,
+        )
         self._decode_slots = UvaBackedTensor(max_num_reqs, dtype=torch.int64)
         self._decode_idx = UvaBackedTensor(max_num_reqs, dtype=torch.int64)
         self._query_lens = UvaBackedTensor(max_num_reqs, dtype=torch.int32)
@@ -1171,7 +1184,7 @@ class DiffusionSampler:
             logprobs_tensors=None,
             num_nans=None,
             num_sampled=num_sampled,
-            num_rejected=num_sampled,
+            num_rejected=self._num_rejected_prefill[:num_reqs],
         )
 
     # ------------------------------------------------------------------
